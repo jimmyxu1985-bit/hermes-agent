@@ -1498,8 +1498,20 @@ def _launchd_print_service_pid(domain: str, label: str) -> tuple[bool, int | Non
 
 
 def _launchd_service_registered(label: str, *, timeout: int = 5) -> bool:
-    """True when launchd knows ``label`` (``launchctl list`` exit 0). Domain-agnostic, so still true on
-    macOS 26+ hosts whose per-user domains reject management. FileNotFoundError/TimeoutExpired propagate."""
+    """True when launchd is *running* a process for ``label``.
+
+    Historically this answered "launchd knows ``label``" (``launchctl list`` exit 0), which is also true
+    for a merely registered definition (``state = not running``) and — on hosts where ``launchctl list``
+    is unusable — false even while launchd supervises the gateway, so :func:`_is_service_running` reported
+    "not running" for a live supervised service. Prefer the domain-explicit print probe: it answers
+    authoritatively once it locates the job, and a PID only exists when a process is actually running.
+    ``launchctl list`` stays as a compatibility fallback for hosts whose per-user domains reject print
+    (there locating fails entirely and ``list`` is the only remaining signal).
+    FileNotFoundError/TimeoutExpired propagate."""
+    domain, pid = _locate_launchd_gateway_service(label)
+    if domain is not None:
+        # Print answered: "registered and running" vs "registered but idle" are now distinguishable.
+        return pid is not None
     result = subprocess.run(["launchctl", "list", label], timeout=timeout, **_CAPTURE_TEXT)
     return result.returncode == 0
 

@@ -142,14 +142,27 @@ def _launchctl_supervised_pid(label: str) -> int | None:
     """PID launchd currently runs for ``label``, or None when it runs none. ``launchctl list`` exits 0 for
     a mere registered definition (``state = not running`` on macOS 26+), so a PID — not the exit code — is
     the answer. Domain-agnostic on purpose: ``launchctl print`` domain probes fail on macOS-26 per-user
-    domains, which is why the invoking profile verifies through this and not ``_launchd_print_service_pid``."""
+    domains, which is why the invoking profile verifies through this and not ``_launchd_print_service_pid``.
+
+    Compatibility fallback: on hosts where ``launchctl list`` is unusable it answers rc != 0 with empty
+    output for *every* label — including ones launchd actively supervises — which silently read as
+    "unsupervised" and sent ``_launchd_degrade_or_raise`` down its detached-fallback path. When the list
+    probe yields no PID (rc != 0, empty stdout, or unparseable output) this falls back to the
+    domain-explicit print probe the repo already ships. No launchctl parsing is added here:
+    :func:`_locate_launchd_gateway_service` owns it (``gui/<uid>`` then ``user/<uid>``)."""
     try:
         result = subprocess.run(["launchctl", "list", label], check=False, timeout=10, **_gw()._CAPTURE_TEXT)
     except (subprocess.TimeoutExpired, OSError):
+        result = None
+    if result is not None and result.returncode == 0:
+        pid = _gw()._parse_launchd_pid_from_list_output(result.stdout)
+        if pid is not None:
+            return pid
+    try:
+        _domain, pid = _gw()._locate_launchd_gateway_service(label)
+    except (subprocess.TimeoutExpired, OSError):
         return None
-    if result.returncode != 0:
-        return None
-    return _gw()._parse_launchd_pid_from_list_output(result.stdout)
+    return pid
 
 
 def _launchctl_label_supervising_process(label: str) -> bool:
@@ -900,11 +913,22 @@ def launchd_status(deep: bool = False):
 
     # `launchctl list` exits 0 for any registered definition (even `state = not running`); only a PID proves a process.
     launchd_pid = _gw()._parse_launchd_pid_from_list_output(list_output) if service_listed else None
+    if launchd_pid is None:
+        # `launchctl list` infers its domain from the caller's context and is unusable on some hosts
+        # (rc 1 + empty output even while launchd supervises the job). Resolve the live PID through the
+        # domain-explicit print probe instead; `launchctl list` stays only as a compat signal below.
+        try:
+            _launchd_domain, launchd_pid = _gw()._locate_launchd_gateway_service(label)
+        except (subprocess.TimeoutExpired, OSError):
+            launchd_pid = None
 
-    # Hermes PID may be a detached fallback process; when launchd IS supervising both PIDs match — don't double-count.
+    # The supervising PID and the gateway's runtime PID are two different processes by design (launchd
+    # supervises a wrapper that execs the gateway), so never equate them. A supervised job is also never
+    # "detached": suppress the detached note whenever launchd supervises something, or the status page
+    # reports supervised and detached at the same time.
     from gateway.status import get_running_pid
     fallback_pid = get_running_pid(cleanup_stale=False)
-    if launchd_pid is not None and fallback_pid == launchd_pid:
+    if launchd_pid is not None:
         fallback_pid = None
 
     # Marker from a 5/125 bootstrap/kickstart failure explains *why* launchd can't supervise.
@@ -917,7 +941,7 @@ def launchd_status(deep: bool = False):
         print("⚠ Service definition is stale relative to the current Hermes install")
         print("  Run: hermes gateway start")
 
-    if not service_listed:
+    if launchd_pid is None and not service_listed:
         print("✗ Gateway service is not loaded")
         print("  Service definition exists locally but launchd has not loaded it.")
         print("  Run: hermes gateway start")
