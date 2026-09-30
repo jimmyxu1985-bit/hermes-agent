@@ -894,7 +894,7 @@ def _restart_launchd_gateway_after_update(
     """
     from hermes_cli.gateway import (
         get_launchd_label, get_launchd_plist_path, launchd_restart, wait_for_launchd_gateway_supervision,
-        _is_pid_ancestor_of_current_process, _launchctl_supervised_pid,
+        _is_pid_ancestor_of_current_process, _launchctl_list_pid,
     )
     current_label = get_launchd_label()
     old_pid = None
@@ -904,7 +904,9 @@ def _restart_launchd_gateway_after_update(
         # Snapshot BEFORE the restart: "supervising some pid" was true before too, so only a pid that
         # actually changed distinguishes a restart from a no-op (the sibling loop's contract). Read-only
         # and verification-only — the restart itself is never gated on `launchctl list` (#74973).
-        old_pid = _launchctl_supervised_pid(current_label) if supervision_verify else None
+        # List-only on purpose: the invoking profile is verified domain-agnostically, and locate is the
+        # sibling-only entrance, so this snapshot must not resolve a domain (`_launchctl_list_pid`).
+        old_pid = _launchctl_list_pid(current_label) if supervision_verify else None
         try:
             launchd_restart()
         except subprocess.CalledProcessError as e:

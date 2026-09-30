@@ -138,6 +138,30 @@ def _launchd_reload_budget() -> float:
     return max(30.0, _gw()._get_restart_drain_timeout())
 
 
+def _launchctl_list_pid(label: str) -> int | None:
+    """PID ``launchctl list <label>`` records for ``label`` — list-only, never a domain probe.
+
+    Deliberately NOT domain-aware: this is the pre-restart PID snapshot the fleet restart takes for
+    the *invoking* profile, and the invoking profile is verified domain-agnostically on purpose
+    (``launchctl print`` domain probes fail on macOS-26 per-user domains). Locate is the sibling-only
+    entrance the fleet restart is built around, so a snapshot taken here must never show up in a
+    sibling's locate accounting.
+
+    Accepted hole, by design: on hosts where ``launchctl list`` is unusable (rc != 0 with empty output
+    for every label) no pre-restart pid is observable, so ``old_pid`` is None and fresh-pid
+    verification degrades to "any supervised pid counts" — the contract
+    :func:`wait_for_launchd_gateway_supervision` already documents for ``old_pid=None``. Do not plug
+    that hole by locating here.
+    """
+    try:
+        result = subprocess.run(["launchctl", "list", label], check=False, timeout=10, **_gw()._CAPTURE_TEXT)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return _gw()._parse_launchd_pid_from_list_output(result.stdout)
+
+
 def _launchctl_supervised_pid(label: str) -> int | None:
     """PID launchd currently runs for ``label``, or None when it runs none. ``launchctl list`` exits 0 for
     a mere registered definition (``state = not running`` on macOS 26+), so a PID — not the exit code — is
@@ -149,15 +173,14 @@ def _launchctl_supervised_pid(label: str) -> int | None:
     "unsupervised" and sent ``_launchd_degrade_or_raise`` down its detached-fallback path. When the list
     probe yields no PID (rc != 0, empty stdout, or unparseable output) this falls back to the
     domain-explicit print probe the repo already ships. No launchctl parsing is added here:
-    :func:`_locate_launchd_gateway_service` owns it (``gui/<uid>`` then ``user/<uid>``)."""
-    try:
-        result = subprocess.run(["launchctl", "list", label], check=False, timeout=10, **_gw()._CAPTURE_TEXT)
-    except (subprocess.TimeoutExpired, OSError):
-        result = None
-    if result is not None and result.returncode == 0:
-        pid = _gw()._parse_launchd_pid_from_list_output(result.stdout)
-        if pid is not None:
-            return pid
+    :func:`_locate_launchd_gateway_service` owns it (``gui/<uid>`` then ``user/<uid>``).
+
+    Callers that must stay domain-agnostic — the fleet restart's pre-restart snapshot — use
+    :func:`_launchctl_list_pid`, which is this probe without the fallback.
+    """
+    list_pid = _gw()._launchctl_list_pid(label)
+    if list_pid is not None:
+        return list_pid
     try:
         _domain, pid = _gw()._locate_launchd_gateway_service(label)
     except (subprocess.TimeoutExpired, OSError):
